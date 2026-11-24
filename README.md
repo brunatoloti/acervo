@@ -35,7 +35,6 @@ O endereço padrão é `http://localhost:8501`.
 3. Crie uma planilha vazia e compartilhe-a como **Editor** com o `client_email` da conta de serviço.
 4. Copie o ID que fica entre `/d/` e `/edit` na URL da planilha.
 5. No arquivo `.streamlit/secrets.toml`, configure a conexão.
-```
 
 O app usa `st.connection("gsheets", type=GSheetsConnection)`. As abas `musicas`, `configuracoes`, `favoritos` e `progresso` são criadas quando recebem os primeiros dados.
 
