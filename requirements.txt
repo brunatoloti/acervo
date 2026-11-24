@@ -1,0 +1,8 @@
+streamlit>=1.60,<2
+st-gsheets-connection>=0.1,<1
+streamlit-authenticator>=0.4.2,<0.5
+google-auth>=2,<3
+requests>=2.31,<3
+pandas>=2.2,<3
+mutagen>=1.47,<2
+

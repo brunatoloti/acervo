@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.acervo_cache/
+.env
+.env.*
+.streamlit/
+.streamlit
+secrets.toml
+venv-wsl/
+__init__.py
