@@ -47,14 +47,70 @@ SOURCE_LABELS = {
 
 AUDIO_CONTROL_JS = """
 export default function(component) {
-  const { data } = component;
+  const { data, setStateValue } = component;
   let attempts = 0;
   let player = null;
   let cancelled = false;
   let persist = null;
   let ended = null;
   let restore = null;
+  let keyboardShortcut = null;
+  const controllerId = Symbol('acervo-media-controller');
+  const mediaActions = ['play', 'pause', 'previoustrack', 'nexttrack'];
   const storageKey = `acervo-audio-position:${data.trackId}`;
+  const sendAction = (action) => setStateValue('action', {
+    action,
+    token: `${Date.now()}-${Math.random()}`
+  });
+  const setMediaAction = (action, handler) => {
+    try {
+      navigator.mediaSession.setActionHandler(action, handler);
+    } catch (_) {
+      // Alguns navegadores implementam apenas parte da Media Session API.
+    }
+  };
+  const configureKeyboardShortcuts = () => {
+    keyboardShortcut = (event) => {
+      const target = event.target;
+      const isEditing = target instanceof HTMLElement && (
+        target.isContentEditable ||
+        ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)
+      );
+      if (isEditing || event.repeat || !(event.ctrlKey || event.metaKey)) return;
+      if (event.key === 'ArrowLeft' && data.hasPrevious) {
+        event.preventDefault();
+        sendAction('previous');
+      } else if (event.key === 'ArrowRight' && data.hasNext) {
+        event.preventDefault();
+        sendAction('next');
+      }
+    };
+    window.addEventListener('keydown', keyboardShortcut);
+  };
+  const configureMediaSession = () => {
+    if (!('mediaSession' in navigator)) return;
+    window.__acervoMediaController = controllerId;
+    if ('MediaMetadata' in window) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: data.title || '',
+        artist: data.artist || '',
+        album: data.album || ''
+      });
+    }
+    navigator.mediaSession.playbackState = data.paused ? 'paused' : 'playing';
+    setMediaAction('play', () => {
+      player.play().catch(() => {});
+      navigator.mediaSession.playbackState = 'playing';
+      sendAction('play');
+    });
+    setMediaAction('pause', () => {
+      player.pause();
+      navigator.mediaSession.playbackState = 'paused';
+      sendAction('pause');
+    });
+    setMediaAction('previoustrack', data.hasPrevious ? () => sendAction('previous') : null);
+    setMediaAction('nexttrack', data.hasNext ? () => sendAction('next') : null);
+  };
   const applyCommand = () => {
     const players = document.querySelectorAll('audio');
     player = players.length ? players[players.length - 1] : null;
@@ -89,10 +145,21 @@ export default function(component) {
     player.addEventListener('ended', ended);
     if (player.readyState >= 1) restore();
     else player.addEventListener('loadedmetadata', restore, { once: true });
+    configureKeyboardShortcuts();
+    configureMediaSession();
   };
   applyCommand();
   return () => {
     cancelled = true;
+    if ('mediaSession' in navigator && window.__acervoMediaController === controllerId) {
+      mediaActions.forEach((action) => setMediaAction(action, null));
+      navigator.mediaSession.metadata = null;
+      navigator.mediaSession.playbackState = 'none';
+      delete window.__acervoMediaController;
+    }
+    if (keyboardShortcut) {
+      window.removeEventListener('keydown', keyboardShortcut);
+    }
     if (!player) return;
     if (persist) {
       persist();
@@ -338,6 +405,51 @@ def load_favorites(store: GoogleSheetsStore) -> None:
         st.session_state.favorites_owner = store.owner_id
 
 
+def refresh_catalog(
+    store: GoogleSheetsStore,
+    progress: Any,
+) -> tuple[list[str], list[str]]:
+    settings = store.settings()
+    refreshed: list[str] = []
+    errors: list[str] = []
+    catalog = store.tracks()
+
+    drive_folder = settings.get("drive_folder", "").strip()
+    if drive_folder:
+        try:
+            service = get_drive_service()
+            folder_id, rows = scan_drive_music(
+                service, drive_folder, CACHE_DIR, progress
+            )
+            catalog = store.sync_catalog(
+                "musicas",
+                rows,
+                f"google_drive:{folder_id}",
+                source="google_drive",
+            )
+            refreshed.append("Google Drive")
+        except Exception as exc:
+            errors.append(f"Google Drive: {exc}")
+
+    music_root = settings.get("music_root", "").strip()
+    if music_root:
+        try:
+            rows = scan_music(music_root, CACHE_DIR, progress)
+            normalized_root = str(resolve_library_path(music_root).resolve())
+            catalog = store.sync_catalog(
+                "musicas", rows, normalized_root, source="local"
+            )
+            refreshed.append("pasta local")
+        except Exception as exc:
+            errors.append(f"Pasta local: {exc}")
+
+    st.session_state.tracks = catalog
+    st.session_state.settings = settings
+    st.session_state.settings_owner = store.owner_id
+    st.session_state.library_owner = store.owner_id
+    return refreshed, errors
+
+
 def sidebar_header(display_name: str) -> None:
     with st.sidebar:
         st.markdown("# ◉ Acervo")
@@ -355,20 +467,34 @@ def sidebar_navigation(pages: list[tuple[Any, str, str]]) -> None:
             )
 
 
-def sidebar_footer(store: GoogleSheetsStore, authenticator: Any) -> None:
+def sidebar_footer(store: GoogleSheetsStore) -> None:
     with st.sidebar:
         st.divider()
         if st.button("Atualizar dados", use_container_width=True):
-            st.session_state.pop("acervo_sheet_credentials", None)
-            load_library(store, force=True)
-            st.rerun()
+            callback, widgets = scan_progress()
+            refreshed, errors = refresh_catalog(store, callback)
+            widgets[0].empty()
+            widgets[1].empty()
+            if refreshed:
+                message = "Dados e capas atualizados: " + " e ".join(refreshed) + "."
+                level = "warning" if errors else "success"
+                if errors:
+                    message += " Não foi possível atualizar " + " | ".join(errors)
+                st.session_state.catalog_refresh_notice = (level, message)
+                st.rerun()
+            elif errors:
+                st.error("Não foi possível atualizar o acervo. " + " | ".join(errors))
+            else:
+                load_library(store, force=True)
+                st.session_state.catalog_refresh_notice = (
+                    "info",
+                    "Nenhuma pasta está configurada. Os dados salvos foram recarregados.",
+                )
+                st.rerun()
+        notice = st.session_state.pop("catalog_refresh_notice", None)
+        if notice:
+            getattr(st, notice[0])(notice[1])
         st.caption(f"{len(library_tracks())} faixas")
-        authenticator.logout(
-            button_name="Sair",
-            location="sidebar",
-            key="acervo_logout",
-            use_container_width=True,
-        )
 
 
 def image_or_placeholder(path_value: Any, icon: str, height: int = 180) -> None:
@@ -422,7 +548,7 @@ def clickable_album_card(
             "cover": cover,
         },
         default={"selected": None},
-        height=320,
+        height="content",
         on_selected_change=lambda: None,
     )
     action = getattr(result, "selected", None)
@@ -608,7 +734,7 @@ def render_home() -> None:
     columns = st.columns(3)
     columns[0].metric("Faixas", len(tracks))
     columns[1].metric("Álbuns", len(albums))
-    columns[2].metric("Artistas musicais", len(artists))
+    columns[2].metric("Músicos/bandas", len(artists))
 
     recent = sorted(albums, key=lambda item: item["modified_at"], reverse=True)[:5]
     if recent:
@@ -629,7 +755,7 @@ def scan_progress() -> tuple[Any, Any]:
     return update, (bar, status)
 
 
-def render_settings(store: GoogleSheetsStore) -> None:
+def render_settings(store: GoogleSheetsStore, authenticator: Any) -> None:
     load_settings(store)
     st.markdown('<div class="eyebrow">Música</div>', unsafe_allow_html=True)
     st.title("Configurações")
@@ -696,6 +822,31 @@ def render_settings(store: GoogleSheetsStore) -> None:
     st.markdown("### Formatos recomendados")
     st.write("MP3, FLAC, M4A, OGG, Opus, WAV e AAC.")
 
+    st.divider()
+    st.markdown("### Conta")
+    st.caption("Encerre sua sessão neste dispositivo.")
+    authenticator.logout(
+        button_name="Sair da conta",
+        location="main",
+        key="settings_logout",
+        use_container_width=False,
+    )
+
+
+def skip_queue_track(
+    queue_ids: list[str], current_index: int, offset: int
+) -> None:
+    target_index = current_index + offset
+    if not 0 <= target_index < len(queue_ids):
+        return
+    st.session_state.current_track_id = queue_ids[target_index]
+    st.session_state.playback_paused = False
+    st.session_state.audio_reset = True
+    st.session_state.audio_command_nonce = (
+        st.session_state.get("audio_command_nonce", 0) + 1
+    )
+    st.rerun()
+
 
 def render_player() -> None:
     track_id = st.session_state.get("current_track_id")
@@ -729,29 +880,30 @@ def render_player() -> None:
                 unsafe_allow_html=True,
             )
 
-            previous, following = st.columns(2)
-            if previous.button(
-                "◀",
-                disabled=current_index <= 0,
-                help="Faixa anterior",
-                use_container_width=True,
+            with st.container(
+                horizontal=True,
+                horizontal_alignment="center",
+                gap="small",
             ):
-                st.session_state.current_track_id = queue_ids[current_index - 1]
-                st.session_state.playback_paused = False
-                st.session_state.audio_reset = True
-                st.session_state.audio_command_nonce = st.session_state.get("audio_command_nonce", 0) + 1
-                st.rerun()
-            if following.button(
-                "▶",
-                disabled=current_index >= len(queue_ids) - 1,
-                help="Próxima faixa",
-                use_container_width=True,
-            ):
-                st.session_state.current_track_id = queue_ids[current_index + 1]
-                st.session_state.playback_paused = False
-                st.session_state.audio_reset = True
-                st.session_state.audio_command_nonce = st.session_state.get("audio_command_nonce", 0) + 1
-                st.rerun()
+                if st.button(
+                    "Anterior",
+                    key="player_previous",
+                    icon=":material/skip_previous:",
+                    type="tertiary",
+                    disabled=current_index <= 0,
+                    help="Faixa anterior",
+                ):
+                    skip_queue_track(queue_ids, current_index, -1)
+                if st.button(
+                    "Próxima",
+                    key="player_next",
+                    icon=":material/skip_next:",
+                    type="tertiary",
+                    disabled=current_index >= len(queue_ids) - 1,
+                    help="Próxima faixa",
+                ):
+                    skip_queue_track(queue_ids, current_index, 1)
+
             try:
                 if track_source(track) == "google_drive":
                     audio_path = ensure_drive_file(
@@ -774,16 +926,41 @@ def render_player() -> None:
                     autoplay=not paused,
                 )
                 if AUDIO_CONTROLLER is not None:
-                    AUDIO_CONTROLLER(
+                    controller_result = AUDIO_CONTROLLER(
                         key=f"audio_controller_{track_id}",
                         data={
                             "paused": paused,
                             "trackId": str(track_id),
+                            "title": str(track.get("title") or ""),
+                            "artist": str(track.get("artist") or ""),
+                            "album": str(track.get("album") or ""),
+                            "hasPrevious": current_index > 0,
+                            "hasNext": current_index < len(queue_ids) - 1,
                             "reset": bool(st.session_state.get("audio_reset", False)),
                             "token": st.session_state.get("audio_command_nonce", 0),
                         },
+                        default={"action": None},
+                        on_action_change=lambda: None,
                     )
                     st.session_state.audio_reset = False
+                    media_action = getattr(controller_result, "action", None)
+                    if hasattr(media_action, "get") and media_action.get("token"):
+                        action_token = str(media_action["token"])
+                        if st.session_state.get("media_action_token") != action_token:
+                            st.session_state.media_action_token = action_token
+                            action = media_action.get("action")
+                            if action == "previous" and current_index > 0:
+                                skip_queue_track(queue_ids, current_index, -1)
+                            elif action == "next" and current_index < len(queue_ids) - 1:
+                                skip_queue_track(queue_ids, current_index, 1)
+                            elif action == "play":
+                                st.session_state.playback_paused = False
+                            elif action == "pause":
+                                st.session_state.playback_paused = True
+                            else:
+                                return
+                            st.session_state.audio_command_nonce = st.session_state.get("audio_command_nonce", 0) + 1
+                            st.rerun()
             except Exception as exc:
                 st.error(f"Não foi possível tocar esta faixa: {exc}")
 
@@ -806,7 +983,7 @@ music_page = st.Page(
     url_path="musicas",
 )
 settings_page = st.Page(
-    lambda: render_settings(store),
+    lambda: render_settings(store, authenticator),
     title="Configurações",
     icon=":material/settings:",
     url_path="configuracoes",
@@ -822,7 +999,7 @@ sidebar_navigation(
         (settings_page, "Configurações", ":material/settings:"),
     ]
 )
-sidebar_footer(store, authenticator)
+sidebar_footer(store)
 navigation.run()
 render_player()
 
