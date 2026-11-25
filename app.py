@@ -126,7 +126,10 @@ export default function(component) {
         sessionStorage.setItem(storageKey, String(player.currentTime));
       }
     };
-    ended = () => sessionStorage.setItem(storageKey, '0');
+    ended = () => {
+      sessionStorage.setItem(storageKey, '0');
+      if (data.hasNext) sendAction('next');
+    };
     restore = () => {
       if (cancelled) return;
       if (data.reset) {
